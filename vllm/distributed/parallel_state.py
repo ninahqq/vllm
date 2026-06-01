@@ -1265,11 +1265,35 @@ def get_dcp_group() -> GroupCoordinator:
 get_context_model_parallel_group = get_dcp_group
 
 _PP: GroupCoordinator | None = None
+# Per-cloud-device PP groups for edge-cloud multi-cloud routing.
+_PP_CLOUDS: dict[int, GroupCoordinator] = {}
 
 
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
+
+
+def get_pp_group_for_cloud(cloud_id: int) -> GroupCoordinator:
+    """Get the PP group for a specific Cloud device in edge-cloud mode."""
+    assert cloud_id in _PP_CLOUDS, (
+        f"PP group for cloud device {cloud_id} is not initialized. "
+        f"Available: {list(_PP_CLOUDS.keys())}"
+    )
+    return _PP_CLOUDS[cloud_id]
+
+
+# Per-cloud-device TP groups for edge-cloud multi-cloud routing.
+_TP_CLOUDS: dict[int, GroupCoordinator] = {}
+
+
+def get_tp_group_for_cloud(cloud_id: int) -> GroupCoordinator:
+    """Get the TP group for a specific Cloud device in edge-cloud mode."""
+    assert cloud_id in _TP_CLOUDS, (
+        f"TP group for cloud device {cloud_id} is not initialized. "
+        f"Available: {list(_TP_CLOUDS.keys())}"
+    )
+    return _TP_CLOUDS[cloud_id]
 
 
 _DP: GroupCoordinator | None = None
@@ -1562,36 +1586,63 @@ def initialize_model_parallel(
             get_world_group().device_group
         )
         edge_npu_count = parallel_config.edge_npu_count
+        cloud_device_count = getattr(parallel_config, "cloud_device_count", 1)
+        cloud_npus_per_device = getattr(
+            parallel_config, "cloud_npus_per_device",
+            parallel_config.cloud_npu_count,
+        )
         is_edge = rank < edge_npu_count
         _IS_EDGE_DEVICE = is_edge
 
+        # Edge TP group (often degenerate)
         tp_edge_ranks = list(range(edge_npu_count))
-        tp_cloud_ranks = list(range(edge_npu_count, world_size))
         assert _TP is None, "tensor model parallel group is already initialized"
         _TP = init_model_parallel_group(
-            [tp_edge_ranks, tp_cloud_ranks],
+            [tp_edge_ranks],
             get_world_group().local_rank,
             backend,
             use_message_queue_broadcaster=True,
             group_name="tp",
         )
 
-        pp_group_ranks = [0, edge_npu_count]
-        pp_other_ranks = [
-            [r] for r in range(world_size) if r not in (0, edge_npu_count)
-        ]
-        assert _PP is None, "pipeline model parallel group is already initialized"
-        _PP = init_model_parallel_group(
-            [pp_group_ranks] + pp_other_ranks,
-            get_world_group().local_rank,
-            backend,
-            group_name="pp",
-        )
+        global _TP_CLOUDS, _PP_CLOUDS
+        # Create independent TP/PP groups for each Cloud device.
+        # When cloud_device_count == 1, this falls back to the legacy behavior.
+        for cloud_id in range(cloud_device_count):
+            start_rank = edge_npu_count + cloud_id * cloud_npus_per_device
+            end_rank = start_rank + cloud_npus_per_device
+            cloud_tp_ranks = list(range(start_rank, end_rank))
+            _TP_CLOUDS[cloud_id] = init_model_parallel_group(
+                [cloud_tp_ranks],
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=True,
+                group_name=f"tp_cloud_{cloud_id}",
+            )
+            # PP group: Edge rank 0 <-> first rank of this Cloud device
+            cloud_pp_ranks = [0, start_rank]
+            _PP_CLOUDS[cloud_id] = init_model_parallel_group(
+                [cloud_pp_ranks],
+                get_world_group().local_rank,
+                backend,
+                group_name=f"pp_cloud_{cloud_id}",
+            )
+
+        # Legacy _PP for backward compatibility (points to the first Cloud device)
+        _PP = _PP_CLOUDS[0]
+
+        # Degenerate groups for remaining ranks (not in any TP/PP pair)
+        used_ranks = set(tp_edge_ranks)
+        for cloud_id in range(cloud_device_count):
+            start_rank = edge_npu_count + cloud_id * cloud_npus_per_device
+            end_rank = start_rank + cloud_npus_per_device
+            used_ranks.update(range(start_rank, end_rank))
+        other_ranks = [[r] for r in range(world_size) if r not in used_ranks]
 
         all_ranks = list(range(world_size))
         assert _DCP is None, "decode context model parallel group is already initialized"
         _DCP = init_model_parallel_group(
-            [[r] for r in all_ranks],
+            [[r] for r in all_ranks] + other_ranks,
             get_world_group().local_rank,
             backend,
             use_message_queue_broadcaster=True,
@@ -1599,21 +1650,21 @@ def initialize_model_parallel(
         )
         assert _PCP is None, "prefill context parallel group is already initialized"
         _PCP = init_model_parallel_group(
-            [[r] for r in all_ranks],
+            [[r] for r in all_ranks] + other_ranks,
             get_world_group().local_rank,
             backend,
             group_name="pcp",
         )
         assert _DP is None, "data parallel group is already initialized"
         _DP = init_model_parallel_group(
-            [[r] for r in all_ranks],
+            [[r] for r in all_ranks] + other_ranks,
             get_world_group().local_rank,
             backend,
             group_name="dp",
         )
         assert _EP is None, "expert parallel group is already initialized"
         _EP = init_model_parallel_group(
-            [[r] for r in all_ranks],
+            [[r] for r in all_ranks] + other_ranks,
             get_world_group().local_rank,
             backend,
             group_name="ep",
@@ -1621,15 +1672,17 @@ def initialize_model_parallel(
 
         logger.info_once(
             "Edge-cloud collaboration mode initialized: rank=%s, is_edge=%s, "
-            "edge_npu_count=%s, cloud_npu_count=%s, TP edge ranks=%s, "
-            "TP cloud ranks=%s, PP group ranks=%s",
+            "edge_npu_count=%s, cloud_npu_count=%s, cloud_device_count=%s, "
+            "cloud_npus_per_device=%s, TP edge ranks=%s, "
+            "PP groups=%s",
             rank,
             is_edge,
             edge_npu_count,
             parallel_config.cloud_npu_count,
+            cloud_device_count,
+            cloud_npus_per_device,
             tuple(tp_edge_ranks),
-            tuple(tp_cloud_ranks),
-            tuple(pp_group_ranks),
+            [list(g.ranks) for g in _PP_CLOUDS.values()],
         )
         return
 
@@ -1974,10 +2027,20 @@ def destroy_model_parallel():
         _PCP.destroy()
     _PCP = None
 
-    global _PP
+    global _PP, _PP_CLOUDS
     if _PP:
         _PP.destroy()
     _PP = None
+    for g in _PP_CLOUDS.values():
+        if g:
+            g.destroy()
+    _PP_CLOUDS.clear()
+
+    global _TP_CLOUDS
+    for g in _TP_CLOUDS.values():
+        if g:
+            g.destroy()
+    _TP_CLOUDS.clear()
 
     global _DP
     if _DP:

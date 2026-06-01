@@ -162,11 +162,19 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             if self.parallel_config.enable_edge_cloud:
-                global_start_rank = (
-                    0
-                    if self.parallel_config.is_edge_node
-                    else self.parallel_config.edge_npu_count
-                )
+                if self.parallel_config.is_edge_node:
+                    global_start_rank = 0
+                else:
+                    edge_npus = self.parallel_config.edge_npu_count
+                    cloud_npus_per_node = getattr(
+                        self.parallel_config,
+                        "cloud_npus_per_device",
+                        self.parallel_config.cloud_npu_count,
+                    )
+                    cloud_node_idx = max(0, self.parallel_config.node_rank - 1)
+                    global_start_rank = (
+                        edge_npus + cloud_node_idx * cloud_npus_per_node
+                    )
             else:
                 global_start_rank = (
                     self.local_world_size * self.parallel_config.node_rank_within_dp
@@ -278,11 +286,15 @@ class MultiprocExecutor(Executor):
 
     def _is_driver_worker(self, rank: int) -> bool:
         if self.parallel_config.enable_edge_cloud:
-            return rank == (
-                0
-                if self.parallel_config.is_edge_node
-                else self.parallel_config.edge_npu_count
+            if self.parallel_config.is_edge_node:
+                return rank == 0
+            edge_npus = self.parallel_config.edge_npu_count
+            cloud_npus_per_node = getattr(
+                self.parallel_config,
+                "cloud_npus_per_device",
+                self.parallel_config.cloud_npu_count,
             )
+            return (rank - edge_npus) % cloud_npus_per_node == 0
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:

@@ -482,6 +482,8 @@ class EngineArgs:
     enable_edge_cloud: bool = ParallelConfig.enable_edge_cloud
     edge_npu_count: int = ParallelConfig.edge_npu_count
     cloud_npu_count: int = ParallelConfig.cloud_npu_count
+    cloud_device_count: int = ParallelConfig.cloud_device_count
+    cloud_npus_per_device: int = ParallelConfig.cloud_npus_per_device
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -1056,6 +1058,12 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--cloud-npu-count", **parallel_kwargs["cloud_npu_count"]
+        )
+        parallel_group.add_argument(
+            "--cloud-device-count", **parallel_kwargs["cloud_device_count"]
+        )
+        parallel_group.add_argument(
+            "--cloud-npus-per-device", **parallel_kwargs["cloud_npus_per_device"]
         )
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
@@ -1774,35 +1782,41 @@ class EngineArgs:
             "nnodes > 1 is only supported with data_parallel_backend=mp"
         )
         inferred_data_parallel_rank = 0
-        if self.nnodes > 1 and not self.enable_edge_cloud:
-            world_size = (
-                self.data_parallel_size
-                * self.pipeline_parallel_size
-                * self.tensor_parallel_size
-            )
-            world_size_within_dp = (
-                self.pipeline_parallel_size * self.tensor_parallel_size
-            )
-            local_world_size = world_size // self.nnodes
-            assert world_size % self.nnodes == 0, (
-                f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
-            )
+        if self.nnodes > 1:
             assert self.node_rank < self.nnodes, (
                 f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
             )
-            inferred_data_parallel_rank = (
-                self.node_rank * local_world_size
-            ) // world_size_within_dp
-            if self.data_parallel_size > 1 and self.data_parallel_external_lb:
-                self.data_parallel_rank = inferred_data_parallel_rank
-                logger.info(
-                    "Inferred data_parallel_rank %d from node_rank %d for external lb",
-                    self.data_parallel_rank,
-                    self.node_rank,
+            if self.enable_edge_cloud:
+                # Edge-cloud multi-node: no data parallelism, each node manages
+                # its own workers. Set data_parallel_size_local to avoid None.
+                if self.data_parallel_size_local is None:
+                    self.data_parallel_size_local = 1
+            else:
+                world_size = (
+                    self.data_parallel_size
+                    * self.pipeline_parallel_size
+                    * self.tensor_parallel_size
                 )
-            elif self.data_parallel_size_local is None:
-                # Infer data parallel size local for internal dplb:
-                self.data_parallel_size_local = max(
+                world_size_within_dp = (
+                    self.pipeline_parallel_size * self.tensor_parallel_size
+                )
+                local_world_size = world_size // self.nnodes
+                assert world_size % self.nnodes == 0, (
+                    f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
+                )
+                inferred_data_parallel_rank = (
+                    self.node_rank * local_world_size
+                ) // world_size_within_dp
+                if self.data_parallel_size > 1 and self.data_parallel_external_lb:
+                    self.data_parallel_rank = inferred_data_parallel_rank
+                    logger.info(
+                        "Inferred data_parallel_rank %d from node_rank %d for external lb",
+                        self.data_parallel_rank,
+                        self.node_rank,
+                    )
+                elif self.data_parallel_size_local is None:
+                    # Infer data parallel size local for internal dplb:
+                    self.data_parallel_size_local = max(
                     local_world_size // world_size_within_dp, 1
                 )
         data_parallel_external_lb = (
@@ -1933,6 +1947,8 @@ class EngineArgs:
             enable_edge_cloud=self.enable_edge_cloud,
             edge_npu_count=self.edge_npu_count,
             cloud_npu_count=self.cloud_npu_count,
+            cloud_device_count=self.cloud_device_count,
+            cloud_npus_per_device=self.cloud_npus_per_device,
             is_edge_node=not headless if self.enable_edge_cloud else False,
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,

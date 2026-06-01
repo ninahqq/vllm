@@ -199,6 +199,10 @@ class ParallelConfig:
     """Number of NPUs on the edge node when edge-cloud mode is enabled."""
     cloud_npu_count: int = 0
     """Number of NPUs on the cloud node when edge-cloud mode is enabled."""
+    cloud_device_count: int = 1
+    """Number of independent Cloud devices (each with a full model replica)."""
+    cloud_npus_per_device: int = 8
+    """Number of NPUs inside each Cloud device (for intra-device TP)."""
     is_edge_node: bool = False
     """Whether this engine process belongs to the edge node."""
 
@@ -654,6 +658,9 @@ class ParallelConfig:
     def nnodes_within_dp(self) -> int:
         if self.nnodes == 1:
             return 1
+        if self.enable_edge_cloud:
+            # Edge-cloud mode: all nodes share the same inner_dp_world
+            return self.nnodes
         data_parallel_node_size = (
             self.data_parallel_size // self.data_parallel_size_local
         )
@@ -662,7 +669,10 @@ class ParallelConfig:
     @property
     def local_world_size(self) -> int:
         if self.enable_edge_cloud:
-            return self.edge_npu_count if self.is_edge_node else self.cloud_npu_count
+            if self.is_edge_node:
+                return self.edge_npu_count
+            # Each Cloud node only has cloud_npus_per_device NPUs locally
+            return self.cloud_npus_per_device
         return self.world_size // self.nnodes_within_dp
 
     @staticmethod
