@@ -113,7 +113,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.config.quantization import _ONLINE_SHORTHANDS
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
-    from vllm.model_executor.models.deepseek_v4 import DeepseekV4FP8Config
 
     from .auto_gptq import AutoGPTQConfig
     from .awq import AWQConfig
@@ -165,7 +164,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
-        "deepseek_v4_fp8": DeepseekV4FP8Config,
         "cpu_awq": CPUAWQConfig,
         "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
@@ -180,6 +178,12 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
             f"existing quantization method"
         )
         method_to_config[shorthand] = OnlineQuantizationConfig
+
+    # DeepseekV4FP8Config is lazily loaded on demand to avoid pulling in
+    # heavy deepseek_v4 dependencies for unrelated models.
+    if quantization == "deepseek_v4_fp8":
+        from vllm.model_executor.models.deepseek_v4 import DeepseekV4FP8Config
+        method_to_config["deepseek_v4_fp8"] = DeepseekV4FP8Config
 
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
