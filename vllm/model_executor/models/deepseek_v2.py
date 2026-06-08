@@ -1714,7 +1714,10 @@ class DeepseekV2ForCausalLM(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            ignore_unexpected_prefixes=["rot."],
+        )
         return loader.load_weights(weights)
 
 
