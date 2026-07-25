@@ -336,6 +336,30 @@ class WorkerWrapperBase:
 
         return self.worker.execute_model(scheduler_output)
 
+    def execute_model_batched_pre(
+        self, scheduler_output: SchedulerOutput
+    ) -> Any:
+        """Run the shared-model batched preprocess through the wrapper.
+
+        ``execute_model`` normally applies the worker-side multimodal cache
+        before delegating to the device worker.  The shared-model executor
+        calls a split ``execute_model_batched_pre`` entry point instead, so it
+        must preserve that wrapper contract as well.  Keeping the hook here
+        also avoids having executors reach through ``WorkerWrapperBase`` and
+        accidentally bypass future wrapper-level input transforms.
+        """
+        self._apply_mm_cache(scheduler_output)
+
+        execute_model_batched_pre = getattr(
+            self.worker, "execute_model_batched_pre", None
+        )
+        if execute_model_batched_pre is None:
+            raise AttributeError(
+                f"{type(self.worker).__name__} does not implement "
+                "execute_model_batched_pre"
+            )
+        return execute_model_batched_pre(scheduler_output)
+
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
         if mm_receiver_cache is not None:

@@ -89,6 +89,7 @@ from vllm.config.parallel import (
     DataParallelBackend,
     DCPCommBackend,
     DistributedExecutorBackend,
+    EdgeModelLayout,
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import SchedulerPolicy
@@ -469,6 +470,7 @@ class EngineArgs:
     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
     enable_edge_cloud: bool = ParallelConfig.enable_edge_cloud
+    edge_model_layout: EdgeModelLayout = ParallelConfig.edge_model_layout
     edge_npu_count: int = ParallelConfig.edge_npu_count
     cloud_npu_count: int = ParallelConfig.cloud_npu_count
     enable_dbo: bool = ParallelConfig.enable_dbo
@@ -1022,6 +1024,9 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--enable-edge-cloud", **parallel_kwargs["enable_edge_cloud"]
+        )
+        parallel_group.add_argument(
+            "--edge-model-layout", **parallel_kwargs["edge_model_layout"]
         )
         parallel_group.add_argument(
             "--edge-npu-count", **parallel_kwargs["edge_npu_count"]
@@ -1893,6 +1898,7 @@ class EngineArgs:
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
             enable_edge_cloud=self.enable_edge_cloud,
+            edge_model_layout=self.edge_model_layout,
             edge_npu_count=self.edge_npu_count,
             cloud_npu_count=self.cloud_npu_count,
             is_edge_node=not headless if self.enable_edge_cloud else False,

@@ -265,15 +265,13 @@ def set_device_control_env_var(
     Temporarily set CUDA_VISIBLE_DEVICES or equivalent
     for engine subprocess.
     """
-    # In the shared-model edge-cloud topology the edge side
-    # shares a single ``SharedModelWorkerProc`` across all
-    # local DP ranks on this node. The per-shard device
-    # allocation is therefore always the first shard
-    # (``local_dp_rank = 0``); non-zero local DP ranks share
-    # the same NPU(s) through the single shared worker.
+    # Shared-model edge-cloud maps every logical DP rank to the physical edge
+    # replica hosting its group. Global-shared maps every rank to device 0;
+    # grouped-shared maps each contiguous DP group to one edge device.
     if (vllm_config.parallel_config.is_shared_model_edge
             and vllm_config.parallel_config.is_edge_node):
-        local_dp_rank = 0
+        local_dp_rank = vllm_config.parallel_config.edge_group_id(
+            local_dp_rank)
     world_size = vllm_config.parallel_config.world_size
     local_world_size = vllm_config.parallel_config.local_world_size
     evar = current_platform.device_control_env_var

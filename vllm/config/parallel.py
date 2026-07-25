@@ -34,6 +34,12 @@ _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
+EdgeModelLayout = Literal[
+    "auto",
+    "dedicated",
+    "global_shared",
+    "grouped_shared",
+]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal["torch_nccl", "torch_gloo", "nixl", "pynccl"]
@@ -193,6 +199,14 @@ class ParallelConfig:
 
     enable_edge_cloud: bool = False
     """Enable edge-cloud collaboration mode for Ascend NPU."""
+    edge_model_layout: EdgeModelLayout = "auto"
+    """Edge model placement policy.
+
+    ``auto`` selects ``dedicated`` when edge devices can be evenly assigned
+    to every DP rank, ``global_shared`` for a single edge device, and
+    ``grouped_shared`` when multiple edge devices each host a fixed subset
+    of DP ranks.
+    """
     edge_npu_count: int = 0
     """Total number of edge NPUs across all DP ranks (i.e. the
     sum over all DP instances) when edge-cloud mode is enabled.
@@ -214,16 +228,21 @@ class ParallelConfig:
     """
     is_edge_node: bool = False
     """Whether this engine process belongs to the edge node."""
+    edge_npu_count_total: int = 0
+    """Original edge NPU count before per-DP topology normalization."""
+    cloud_npu_count_total: int = 0
+    """Original cloud NPU count before per-DP topology normalization."""
+    edge_shared_group_count: int = 1
+    """Number of physical edge model replicas in a shared topology."""
+    dp_ranks_per_edge_group: int = 1
+    """Number of logical DP ranks hosted by each shared edge replica."""
     is_shared_model_edge: bool = False
     """Whether the edge side of an edge-cloud configuration is in
     the shared-model topology.
 
-    Set in :meth:`__post_init__` to ``True`` iff
-    :attr:`edge_npu_count` was 1 before being divided by
-    ``data_parallel_size``. A shared-model edge has a single
-    distributed rank hosting ``data_parallel_size`` virtual workers
-    that all share one ``nn.Module`` replica; the cloud side keeps
-    the original per-DP-instance layout.
+    A shared-model edge has one physical distributed rank per shared group.
+    Each group hosts ``dp_ranks_per_edge_group`` virtual workers sharing one
+    ``nn.Module`` replica; the cloud side keeps the per-DP-instance layout.
     """
 
     enable_dbo: bool = False
@@ -522,16 +541,67 @@ class ParallelConfig:
         """world_size_across_dp is TPxPPxDP, it is the size of the world
         including data parallelism.
 
-        For the shared-model edge-cloud topology
-        (:attr:`is_shared_model_edge`) the edge is a single shared
-        distributed rank rather than one rank per DP instance, so
-        the total world size is
-        ``1 + data_parallel_size * cloud_npu_count`` instead of the
-        usual ``(1 + cloud_npu_count) * data_parallel_size``.
+        For a shared-model edge-cloud topology, the edge contributes one
+        distributed rank per shared group rather than one rank per DP
+        instance.
         """
         if self.is_shared_model_edge:
-            return 1 + self.data_parallel_size * self.cloud_npu_count
+            return (
+                self.edge_shared_group_count
+                + self.data_parallel_size * self.cloud_npu_count
+            )
         return self.world_size * self.data_parallel_size
+
+    def edge_group_id(self, dp_rank: int) -> int:
+        """Return the shared edge group hosting ``dp_rank``."""
+        if not 0 <= dp_rank < self.data_parallel_size:
+            raise ValueError(
+                f"dp_rank ({dp_rank}) must be in "
+                f"[0, {self.data_parallel_size})."
+            )
+        if not self.is_shared_model_edge:
+            return dp_rank
+        return dp_rank // self.dp_ranks_per_edge_group
+
+    def edge_group_local_rank(self, dp_rank: int) -> int:
+        """Return the virtual-worker rank within its shared edge group."""
+        if not self.is_shared_model_edge:
+            return 0
+        return dp_rank % self.dp_ranks_per_edge_group
+
+    def edge_group_dp_ranks(self, group_id: int) -> tuple[int, ...]:
+        """Return the global DP ranks hosted by a shared edge group."""
+        if not self.is_shared_model_edge:
+            return (group_id,)
+        if not 0 <= group_id < self.edge_shared_group_count:
+            raise ValueError(
+                f"edge group ({group_id}) must be in "
+                f"[0, {self.edge_shared_group_count})."
+            )
+        start = group_id * self.dp_ranks_per_edge_group
+        return tuple(range(start, start + self.dp_ranks_per_edge_group))
+
+    def edge_group_leader_dp_rank(self, group_id: int) -> int:
+        """Return the EngineCore DP rank that owns the group's worker proc."""
+        return self.edge_group_dp_ranks(group_id)[0]
+
+    def edge_physical_global_rank(self, dp_rank: int) -> int:
+        """Return the physical edge rank serving a logical DP rank."""
+        return self.edge_group_id(dp_rank)
+
+    def cloud_global_ranks(self, dp_rank: int) -> tuple[int, ...]:
+        """Return cloud global ranks belonging to a logical DP rank."""
+        if self.is_shared_model_edge:
+            start = (
+                self.edge_shared_group_count
+                + dp_rank * self.cloud_npu_count
+            )
+        else:
+            start = (
+                dp_rank * (self.edge_npu_count + self.cloud_npu_count)
+                + self.edge_npu_count
+            )
+        return tuple(range(start, start + self.cloud_npu_count))
 
     @property
     def use_ubatching(self) -> bool:
@@ -776,15 +846,21 @@ class ParallelConfig:
         )
 
         if self.enable_edge_cloud:
-            if self.edge_npu_count <= 0 or self.cloud_npu_count <= 0:
+            edge_npu_count_total = (
+                self.edge_npu_count_total or self.edge_npu_count
+            )
+            cloud_npu_count_total = (
+                self.cloud_npu_count_total or self.cloud_npu_count
+            )
+            if edge_npu_count_total <= 0 or cloud_npu_count_total <= 0:
                 raise ValueError(
                     "edge_npu_count and cloud_npu_count must be positive "
                     "when enable_edge_cloud is True."
                 )
-            if self.edge_npu_count >= self.cloud_npu_count:
+            if edge_npu_count_total >= cloud_npu_count_total:
                 raise ValueError(
-                    f"edge_npu_count ({self.edge_npu_count}) must be less than "
-                    f"cloud_npu_count ({self.cloud_npu_count}) for edge-cloud "
+                    f"edge_npu_count ({edge_npu_count_total}) must be less than "
+                    f"cloud_npu_count ({cloud_npu_count_total}) for edge-cloud "
                     "collaboration."
                 )
             if self.pipeline_parallel_size != 1 or self.tensor_parallel_size != 1:
@@ -801,62 +877,89 @@ class ParallelConfig:
             # which a single distributed rank hosts
             # ``data_parallel_size`` virtual workers that share one
             # ``nn.Module``).
-            if self.cloud_npu_count % self.data_parallel_size != 0:
+            if cloud_npu_count_total % self.data_parallel_size != 0:
                 raise ValueError(
-                    f"cloud_npu_count ({self.cloud_npu_count}) must be a "
+                    f"cloud_npu_count ({cloud_npu_count_total}) must be a "
                     f"multiple of data_parallel_size "
                     f"({self.data_parallel_size}) so that each dp "
                     f"instance gets the same number of cloud ranks.")
+
+            if edge_npu_count_total % self.data_parallel_size == 0:
+                inferred_layout: EdgeModelLayout = "dedicated"
+            elif edge_npu_count_total == 1 and self.data_parallel_size > 1:
+                inferred_layout = "global_shared"
+            elif (
+                1 < edge_npu_count_total < self.data_parallel_size
+                and self.data_parallel_size % edge_npu_count_total == 0
+            ):
+                inferred_layout = "grouped_shared"
+            else:
+                raise ValueError(
+                    f"edge_npu_count ({edge_npu_count_total}) must be a "
+                    f"multiple of data_parallel_size ({self.data_parallel_size}), "
+                    "equal to 1, or evenly divide data_parallel_size for "
+                    "grouped shared-model edge execution."
+                )
             if (
-                self.edge_npu_count % self.data_parallel_size != 0
-                and self.edge_npu_count != 1
+                self.edge_model_layout != "auto"
+                and self.edge_model_layout != inferred_layout
             ):
                 raise ValueError(
-                    f"edge_npu_count ({self.edge_npu_count}) must either be "
-                    f"a multiple of data_parallel_size "
-                    f"({self.data_parallel_size}) or equal to 1 (the "
-                    f"shared-model topology, in which a single "
-                    f"distributed rank hosts data_parallel_size "
-                    f"virtual workers).")
-            # ``edge_npu_count`` and ``cloud_npu_count`` are user-
-            # facing total counts (sum over all dp instances). The
-            # rest of vLLM (TP groups, PP groups,
-            # ``local_world_size``, etc.) expects per-dp-instance
-            # counts, so we divide here before any further use. The
-            # pre-division edge value (1 vs. >1) is preserved on
-            # ``is_shared_model_edge`` so downstream code can tell
-            # whether the edge is in the shared-model topology
-            # (one distributed rank hosting
-            # ``data_parallel_size`` virtual workers that share a
-            # single ``nn.Module``) or the original per-rank edge
-            # topology (``edge_npu_count > 1``).
-            # ``is_shared_model_edge`` is True only when the edge has
-            # a single distributed rank AND there are multiple dp
-            # ranks that need to share that one rank. With
-            # ``data_parallel_size == 1`` the "shared model" concept
-            # is meaningless (a single rank trivially "shares" with
-            # itself), so we keep the original per-rank edge layout
-            # even when ``edge_npu_count == 1``.
-            self.is_shared_model_edge = (
-                self.edge_npu_count == 1
-                and self.data_parallel_size > 1
+                    f"edge_model_layout={self.edge_model_layout!r} conflicts "
+                    f"with the topology inferred from edge_npu_count="
+                    f"{edge_npu_count_total} and data_parallel_size="
+                    f"{self.data_parallel_size}: {inferred_layout!r}."
+                )
+            self.edge_model_layout = inferred_layout
+            self.edge_npu_count_total = edge_npu_count_total
+            self.cloud_npu_count_total = cloud_npu_count_total
+            if inferred_layout == "grouped_shared":
+                if self.data_parallel_backend != "mp":
+                    raise ValueError(
+                        "grouped_shared edge execution currently requires "
+                        "data_parallel_backend='mp'."
+                    )
+                if self.data_parallel_external_lb:
+                    raise ValueError(
+                        "grouped_shared edge execution does not currently "
+                        "support external DP load balancing."
+                    )
+                if self.enable_elastic_ep:
+                    raise ValueError(
+                        "grouped_shared edge execution does not currently "
+                        "support elastic expert parallelism."
+                    )
+
+            # Preserve the user-facing totals above, then normalize the
+            # runtime counts to one logical DP instance. Shared layouts have
+            # one physical edge rank per group; dedicated layouts divide the
+            # physical edge ranks evenly across all DP instances.
+            self.is_shared_model_edge = inferred_layout in (
+                "global_shared",
+                "grouped_shared",
             )
-            # In the shared-model edge case the edge has a single
-            # distributed rank that all dp ranks share — dividing
-            # by ``data_parallel_size`` would produce ``0``. Keep
-            # ``edge_npu_count == 1`` (already correct for the new
-            # topology) and only divide the cloud count.
             if self.is_shared_model_edge:
+                self.edge_shared_group_count = (
+                    1
+                    if inferred_layout == "global_shared"
+                    else edge_npu_count_total
+                )
+                self.dp_ranks_per_edge_group = (
+                    self.data_parallel_size // self.edge_shared_group_count
+                )
+                self.edge_npu_count = 1
                 self.cloud_npu_count = (
-                    self.cloud_npu_count // self.data_parallel_size
+                    cloud_npu_count_total // self.data_parallel_size
                 )
             else:
                 self.edge_npu_count = (
-                    self.edge_npu_count // self.data_parallel_size
+                    edge_npu_count_total // self.data_parallel_size
                 )
                 self.cloud_npu_count = (
-                    self.cloud_npu_count // self.data_parallel_size
+                    cloud_npu_count_total // self.data_parallel_size
                 )
+                self.edge_shared_group_count = self.data_parallel_size
+                self.dp_ranks_per_edge_group = 1
 
             # ``world_size`` is per-dp-instance in edge-cloud mode
             # and does not cross dp rank boundaries. The formula
