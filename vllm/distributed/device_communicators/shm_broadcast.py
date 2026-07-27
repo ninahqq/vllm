@@ -764,8 +764,15 @@ class MessageQueue:
                         offset = buf_offset + buf_len
                         all_buffers.append(buf[buf_offset:offset])
                     obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
-            if overflow:
-                obj = MessageQueue.recv(self.local_socket, timeout)
+                else:
+                    # The shared-memory overflow marker and socket multipart
+                    # payload form one logical item. Receive the payload while
+                    # the marker is still inside the acquire_read transaction.
+                    # If the short polling timeout expires, the context exits
+                    # via the exception before marking the block as read or
+                    # advancing current_idx, so the next dequeue retries the
+                    # same item instead of orphaning its late socket payload.
+                    obj = MessageQueue.recv(self.local_socket, timeout)
         elif self._is_remote_reader:
             obj = MessageQueue.recv(self.remote_socket, timeout)
         else:

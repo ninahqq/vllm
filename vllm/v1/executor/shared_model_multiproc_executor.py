@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import queue
 import signal
 import threading
 import time
@@ -24,13 +25,12 @@ import traceback
 import weakref
 from collections import deque
 from copy import deepcopy
-from functools import partial
+from functools import cached_property, partial
 from multiprocessing.synchronize import Lock as LockType
 from threading import Thread
 from typing import Any
 
 import cloudpickle
-import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -247,20 +247,33 @@ class SharedModelWorkerProc:
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
 
-        # The standard one-worker executor can offload async output copies to
-        # one background thread.  A shared worker serves multiple independent
-        # EngineCores, however, and allowing the main loop to consume a later
-        # scheduler step before the earlier response has reached that DP's
-        # response MQ can detach the Future FIFO from the virtual worker's
-        # request-state FIFO.  Keep async scheduling at the engine level, but
-        # serialize response materialization/enqueue in this process.
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
+        self.async_output_queue: queue.Queue[Any] | None = None
+        self.async_output_copy_thread: Thread | None = None
+        self._async_output_stop = object()
+        self._async_output_error: BaseException | None = None
+        self._next_output_seq = [0] * group_size
+        self._written_output_seq = [0] * group_size
 
         # Message queue setup: N (one per dp_rank) broadcast
         # readers + N response writer/peer pairs. The standard
         # _init_message_queues is not used.
         self._init_message_queues(input_shm_handle, vllm_config)
+        if self.use_async_scheduling:
+            # One output thread per physical edge process, not per virtual DP.
+            # Both virtual workers share one NPU, so output materialization is
+            # serialized while the main thread can launch the next model batch.
+            # Every queued item carries its local DP rank and a per-DP sequence
+            # number so the two independent EngineCore Future streams cannot
+            # be cross-routed or reordered.
+            self.async_output_queue = queue.Queue()
+            self.async_output_copy_thread = Thread(
+                target=self.async_output_busy_loop,
+                daemon=True,
+                name=f"SharedEdgeAsyncOutput-{rank}",
+            )
+            self.async_output_copy_thread.start()
 
         # Pending ``AsyncModelRunnerOutput`` markers (i.e. the
         # ``DeferredExecutePostprocess`` instances returned by
@@ -402,6 +415,10 @@ class SharedModelWorkerProc:
 
         init_kv_cache = False
         while True:
+            if self._async_output_error is not None:
+                raise RuntimeError(
+                    "Shared edge async output thread failed"
+                ) from self._async_output_error
             dispatched = False
             for k, mq in enumerate(self.rpc_broadcast_mqs):
                 if paused[k]:
@@ -614,10 +631,7 @@ class SharedModelWorkerProc:
                     # this loop.
                     for dp_rank, deferred in legacy_pending.items():
                         try:
-                            if callable(deferred):
-                                output = deferred()
-                            else:
-                                output = deferred
+                            output = deferred() if callable(deferred) else deferred
                         except Exception as e:
                             if hasattr(e, "add_note"):
                                 e.add_note(traceback.format_exc())
@@ -663,13 +677,37 @@ class SharedModelWorkerProc:
             # only does per-dp_rank preprocess and returns a
             # ``_BatchedExecuteMarker`` (or an early-return
             # ``ModelRunnerOutput`` / ``None`` for no-work cases).
-            # The original head + send path of ``execute_model`` is
-            # not taken; the busy_loop drives the batched head / tail
-            # / per-dp_rank post on the leader runner.
+            # Workers may reject the batched path for scheduler outputs whose
+            # per-request state cannot be merged. Those outputs retain the
+            # original stateful ``execute_model`` head/send path; otherwise
+            # the busy loop drives batched head/tail/post on the leader runner.
             if method == "execute_model" and hasattr(
                     virtual_worker.worker, "execute_model_batched_pre"):
-                output = virtual_worker.execute_model_batched_pre(
-                    args[0] if args else None)
+                scheduler_output = args[0] if args else None
+                should_use_batched = getattr(
+                    virtual_worker.worker,
+                    "should_use_batched_execute",
+                    None,
+                )
+                # Some shared workers can batch only a subset of scheduler
+                # outputs. Edge-cloud multimodal requests, for example, own
+                # per-request encoder and M-RoPE state that cannot be merged
+                # by the virtual-DP fast path. Keep this accelerator-specific
+                # policy duck-typed in the worker implementation.
+                use_batched = (
+                    should_use_batched is None
+                    or should_use_batched(scheduler_output)
+                )
+                if use_batched:
+                    output = virtual_worker.execute_model_batched_pre(
+                        scheduler_output)
+                else:
+                    logger.info_once(
+                        "Shared-model batched execution is bypassed for "
+                        "this scheduler output; using the virtual worker's "
+                        "stateful execute_model path.")
+                    output = virtual_worker.execute_model(
+                        scheduler_output)
             elif isinstance(method, str):
                 func = getattr(virtual_worker, method)
                 output = func(*args, **kwargs)
@@ -714,11 +752,28 @@ class SharedModelWorkerProc:
     def handle_output(self, dp_rank: int, output: Any) -> None:
         """Route a worker output to the matching DP response MQ.
 
-        Response enqueue is intentionally synchronous even when engine-level
-        async scheduling is enabled.  See the initialization comment: each
-        virtual DP must observe the same RPC and request-state order.
+        With async scheduling, every response for a virtual DP goes through
+        the same output queue. This includes immediate values such as ``None``
+        and exceptions: bypassing the queue for those values could let them
+        overtake an earlier ``AsyncModelRunnerOutput`` on the same response MQ.
         """
-        self.enqueue_output(dp_rank, output)
+        if not 0 <= dp_rank < len(self.response_mqs):
+            raise IndexError(
+                f"Invalid local dp_rank={dp_rank}; "
+                f"response_mq_count={len(self.response_mqs)}"
+            )
+        if self._async_output_error is not None:
+            raise RuntimeError("Shared edge async output thread failed") from (
+                self._async_output_error
+            )
+
+        if self.use_async_scheduling:
+            assert self.async_output_queue is not None
+            sequence_id = self._next_output_seq[dp_rank]
+            self._next_output_seq[dp_rank] += 1
+            self.async_output_queue.put((dp_rank, sequence_id, output))
+        else:
+            self.enqueue_output(dp_rank, output)
 
     def enqueue_output(self, dp_rank: int, output: Any) -> None:
         """Write a single response to ``response_mqs[dp_rank]``,
@@ -726,16 +781,75 @@ class SharedModelWorkerProc:
         If ``output`` is an ``AsyncModelRunnerOutput`` (async
         scheduling mode), extract the real output first.
         """
-        if isinstance(output, AsyncModelRunnerOutput):
-            output = output.get_output()
+        try:
+            if isinstance(output, AsyncModelRunnerOutput):
+                output = output.get_output()
+        except Exception as e:
+            if hasattr(e, "add_note"):
+                e.add_note(traceback.format_exc())
+            logger.exception(
+                "Shared edge async output materialization failed on local_dp_rank=%d.",
+                dp_rank,
+            )
+            output = e
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         self.response_mqs[dp_rank].enqueue(result)
 
+    def async_output_busy_loop(self) -> None:
+        """Materialize outputs without blocking shared-model dispatch.
+
+        A single thread serves both virtual DPs hosted by this physical edge
+        process. The queue is globally FIFO and sequence IDs additionally
+        enforce FIFO within each DP's independent response stream.
+        """
+        try:
+            if self.worker and hasattr(self.worker[0], "device"):
+                current_platform.set_device(self.worker[0].device)
+
+            assert self.async_output_queue is not None
+            while True:
+                item = self.async_output_queue.get()
+                if item is self._async_output_stop:
+                    return
+
+                dp_rank, sequence_id, output = item
+                expected = self._written_output_seq[dp_rank]
+                if sequence_id != expected:
+                    output = RuntimeError(
+                        "Shared edge async output sequence mismatch: "
+                        f"local_dp_rank={dp_rank}, expected={expected}, "
+                        f"received={sequence_id}"
+                    )
+                self.enqueue_output(dp_rank, output)
+                self._written_output_seq[dp_rank] = sequence_id + 1
+        except BaseException as e:
+            self._async_output_error = e
+            logger.exception("Shared edge async output thread failed.")
+
+    def _stop_async_output_thread(self) -> None:
+        """Drain queued outputs and stop the per-edge output thread."""
+        output_thread = self.async_output_copy_thread
+        output_queue = self.async_output_queue
+        if output_thread is None or output_queue is None:
+            return
+
+        output_queue.put(self._async_output_stop)
+        output_thread.join(timeout=10)
+        if output_thread.is_alive():
+            logger.warning(
+                "Shared edge async output thread did not stop within 10 seconds."
+            )
+        self.async_output_copy_thread = None
+        self.async_output_queue = None
+
     # ------------------------------------------------------------- shutdown
     def shutdown(self) -> None:
+        # The stop marker is appended after all pending outputs, so the output
+        # thread drains them before response MQs are closed.
+        self._stop_async_output_thread()
         for mq in getattr(self, "rpc_broadcast_mqs", []) or []:
             if mq is not None:
                 mq.shutdown()
@@ -965,6 +1079,18 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
       ``WorkerProc``; the other group members exchange handles through
       the gloo store.
     """
+
+    @cached_property
+    def max_concurrent_batches(self) -> int:
+        # The shared edge path is not a standard PP pipeline. Each virtual
+        # runner owns a single execute_model_state slot. Async scheduling
+        # supports the standard two-batch overlap; without async scheduling,
+        # execution must remain strictly single-batch. In particular, do not
+        # inherit ``pipeline_parallel_size`` from MultiprocExecutor here:
+        # edge-cloud PP is driven explicitly by the shared worker and is not a
+        # standard local pipeline whose bubbles are filled by EngineCore's
+        # batch queue.
+        return 2 if self.scheduler_config.async_scheduling else 1
 
     def _init_executor(self) -> None:
         self._finalizer = weakref.finalize(self, self.shutdown)
