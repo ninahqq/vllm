@@ -764,8 +764,12 @@ class MessageQueue:
                         offset = buf_offset + buf_len
                         all_buffers.append(buf[buf_offset:offset])
                     obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
-            if overflow:
-                obj = MessageQueue.recv(self.local_socket, timeout)
+                else:
+                    # 修改原因：overflow marker 与 socket payload 是同一逻辑消息；
+                    # 若先提交 marker 再等待 socket，短超时会导致 payload 永久失配。
+                    # 修改内容：在 acquire_read 事务内接收真实 payload；超时时不
+                    # 提交 marker，使下一次 dequeue 能重试同一条多模态大消息。
+                    obj = MessageQueue.recv(self.local_socket, timeout)
         elif self._is_remote_reader:
             obj = MessageQueue.recv(self.remote_socket, timeout)
         else:

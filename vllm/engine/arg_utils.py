@@ -89,6 +89,9 @@ from vllm.config.parallel import (
     DataParallelBackend,
     DCPCommBackend,
     DistributedExecutorBackend,
+    # 修改原因：命令行参数需要复用 ParallelConfig 的布局类型约束。
+    # 修改内容：导入 EdgeModelLayout 供 EngineArgs 声明和配置透传。
+    EdgeModelLayout,
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import SchedulerPolicy
@@ -469,6 +472,9 @@ class EngineArgs:
     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
     enable_edge_cloud: bool = ParallelConfig.enable_edge_cloud
+    # 修改原因：需要允许用户显式选择或校验边侧共享模型布局。
+    # 修改内容：新增 --edge-model-layout 对应的 EngineArgs 字段。
+    edge_model_layout: EdgeModelLayout = ParallelConfig.edge_model_layout
     edge_npu_count: int = ParallelConfig.edge_npu_count
     cloud_npu_count: int = ParallelConfig.cloud_npu_count
     enable_dbo: bool = ParallelConfig.enable_dbo
@@ -1023,6 +1029,11 @@ class EngineArgs:
         parallel_group.add_argument(
             "--enable-edge-cloud", **parallel_kwargs["enable_edge_cloud"]
         )
+        # 修改原因：需要允许用户显式选择并校验边侧模型布局。
+        # 修改内容：向 CLI 注册 --edge-model-layout。
+        parallel_group.add_argument(
+            "--edge-model-layout", **parallel_kwargs["edge_model_layout"]
+        )
         parallel_group.add_argument(
             "--edge-npu-count", **parallel_kwargs["edge_npu_count"]
         )
@@ -1423,6 +1434,8 @@ class EngineArgs:
         )
 
         # Other arguments
+        # 修改原因：仅通过 edge_npu_count 推断时无法表达用户的布局预期。
+        # 修改内容：向 CLI 暴露 auto/dedicated/global_shared/grouped_shared。
         parser.add_argument(
             "--disable-log-stats",
             action="store_true",
@@ -1893,6 +1906,8 @@ class EngineArgs:
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
             enable_edge_cloud=self.enable_edge_cloud,
+            # 修改内容：把 CLI 布局选择传入 ParallelConfig，供拓扑校验和建组使用。
+            edge_model_layout=self.edge_model_layout,
             edge_npu_count=self.edge_npu_count,
             cloud_npu_count=self.cloud_npu_count,
             is_edge_node=not headless if self.enable_edge_cloud else False,

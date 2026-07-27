@@ -336,6 +336,29 @@ class WorkerWrapperBase:
 
         return self.worker.execute_model(scheduler_output)
 
+    def execute_model_batched_pre(
+        self, scheduler_output: SchedulerOutput
+    ) -> Any:
+        """通过 WorkerWrapper 执行共享模型的分阶段合批预处理。
+
+        修改原因：普通 ``execute_model`` 会先恢复 worker 侧多模态 IPC cache，
+        但共享模型执行器改调用 ``execute_model_batched_pre``；直接下钻设备
+        Worker 会让 ``mm_features`` 仍是 cache 引用，导致视觉输入缺失。
+        修改内容：在新入口中复用 ``_apply_mm_cache``，再委托设备 Worker，
+        同时保留未来 Wrapper 级输入变换的统一入口。
+        """
+        self._apply_mm_cache(scheduler_output)
+
+        execute_model_batched_pre = getattr(
+            self.worker, "execute_model_batched_pre", None
+        )
+        if execute_model_batched_pre is None:
+            raise AttributeError(
+                f"{type(self.worker).__name__} does not implement "
+                "execute_model_batched_pre"
+            )
+        return execute_model_batched_pre(scheduler_output)
+
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
         if mm_receiver_cache is not None:

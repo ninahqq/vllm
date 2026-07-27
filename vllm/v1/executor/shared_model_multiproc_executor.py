@@ -24,13 +24,15 @@ import time
 import traceback
 import weakref
 from collections import deque
-from functools import partial
+# 修改内容：deepcopy 用于隔离虚拟 DP 配置；cached_property 用于按调度模式
+# 缓存共享执行器并发 batch 上限。
+from copy import deepcopy
+from functools import cached_property, partial
 from multiprocessing.synchronize import Lock as LockType
 from threading import Thread
 from typing import Any
 
 import cloudpickle
-import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -133,29 +135,21 @@ class SharedModelWorkerProc:
 
     READY_STR = "READY"
 
-    # Methods whose dispatch gates a per-dp_rank round barrier in
-    # the busy loop. When a dp_rank dispatches one of these, the
-    # busy loop pauses that dp_rank's MQ intake until every
-    # dp_rank has dispatched one of them in the current "round";
-    # at the end of a pass in which every dp_rank has paused, the
-    # round resets and all dp_ranks resume.
+    # 修改原因：多个独立 EngineCore 并非锁步运行，等待全部 DP 都提交会让活跃
+    # DP 被空闲 DP 永久阻塞。
+    # 修改内容：每轮每个 DP 最多取一个同步方法，随后把当前 polling pass 中
+    # 已到达的任务机会式合批，不要求所有 DP 参与。
     #
     # ``execute_model`` and ``execute_dummy_batch`` are the only
-    # engine-driven per-step methods that need to stay in lockstep
-    # across dp_ranks: the engine dispatches them once per
-    # scheduler step, and the shared model runner cannot start the
-    # next scheduling round until every dp_rank has finished the
-    # current one (their KV-cache heads, in-flight samples, etc.
-    # are not safe to mix across ranks). Without the barrier, a
-    # fast dp_rank could keep the worker busy with its own
-    # ``execute_model`` calls while the others starve.
+    # engine-driven per-step methods that must yield after one dispatch.
+    # Independent EngineCores are not lockstep: an idle DP submits no work,
+    # so requiring every DP to participate would deadlock an active peer.
     #
     # Note that the pause is *global* per dp_rank — i.e. while a
     # dp_rank is paused, the busy loop will not dequeue ANY rpc
     # (including non-SYNC methods such as ``add_lora``) from that
-    # MQ. This is intentional: the engine drives the per-dp_rank
-    # streams in lockstep and any non-SYNC work queued behind a
-    # SYNC method will be picked up on the next round.
+    # MQ. Work queued behind a SYNC method is picked up on the next pass,
+    # after the current available batch has been drained.
     SYNC_METHODS: frozenset[str] = frozenset(
         {"execute_model", "execute_dummy_batch"})
 
@@ -171,6 +165,8 @@ class SharedModelWorkerProc:
         shared_worker_lock: LockType,
         is_driver_worker: bool,
         shared_broadcast_handles: dict[int, Handle] | None = None,
+        # 修改内容：显式传入本物理进程承载的全局 DP 子集。
+        global_dp_ranks: tuple[int, ...] | None = None,
     ) -> None:
         # Stash BEFORE the worker is constructed. The worker class's
         # __init__ calls init_distributed_environment which builds
@@ -179,31 +175,66 @@ class SharedModelWorkerProc:
         self.rank = rank
         self._shared_broadcast_handles: dict[int, Handle] = (
             shared_broadcast_handles or {})
+        # 修改原因：一个物理 WorkerProc 可能只承载全局 DP 的一个子集，需要
+        # 同时区分全局 DP rank 与进程内虚拟 Worker 下标。
+        # 修改内容：保存本组全局 DP 列表并建立 global→local 映射。
+        self.global_dp_ranks = (
+            global_dp_ranks
+            or tuple(range(vllm_config.parallel_config.data_parallel_size))
+        )
+        self._global_to_local_dp_rank = {
+            global_dp_rank: local_dp_rank
+            for local_dp_rank, global_dp_rank in enumerate(self.global_dp_ranks)
+        }
 
-        # Construct dp_size virtual workers (one per dp_rank).
+        # 修改原因：每个逻辑 DP 必须拥有独立请求/KV/采样状态，但模型权重需要
+        # 在同一物理 NPU 上共享。
+        # 修改内容：为本组每个 DP 创建一个虚拟 WorkerWrapper。
         # Each virtual worker has its own WorkerWrapperBase, with
         # ``local_rank=k`` matching its dp_rank. The configured
         # worker class (SharedModelEdgeWorker) does the in-process
         # sharing of model weights.
-        dp_size = vllm_config.parallel_config.data_parallel_size
+        group_size = len(self.global_dp_ranks)
         self.worker: list[WorkerWrapperBase] = []
-        for k in range(dp_size):
-            wrapper = WorkerWrapperBase(rpc_rank=k, global_rank=rank)
+        for local_dp_rank, global_dp_rank in enumerate(self.global_dp_ranks):
+            # 修改原因：ModelRunner 持续读取可变 ParallelConfig；若虚拟 Worker
+            # 共用 leader 配置，所有 Worker 都会把自己识别成组 leader，导致
+            # new/cached step 路由到不同请求状态字典。
+            # 修改内容：为每个虚拟 Worker 深拷贝配置并写入独立 global/local
+            # DP rank。
+            worker_config = deepcopy(vllm_config)
+            worker_parallel_config = worker_config.parallel_config
+            worker_parallel_config.data_parallel_rank = global_dp_rank
+            worker_parallel_config.data_parallel_rank_local = local_dp_rank
+            worker_parallel_config.data_parallel_index = global_dp_rank
+
+            wrapper = WorkerWrapperBase(
+                rpc_rank=local_dp_rank,
+                # 修改原因：每个 EngineCore 的 KV 配置列表都以共享 edge 为第 0
+                # 项，物理 group id 不能作为该列表下标。
+                # 修改内容：虚拟边侧 Worker 固定读取第 0 项，避免组 1 误取云侧
+                # KV 配置。
+                global_rank=0,
+            )
             # The upstream WorkerProc.__init__ does NOT include
             # shared_broadcast_handles in all_kwargs; that is the
             # one divergence we need. The configured worker class
             # can read it through its own __init__ kwargs if it
             # wants to.
             all_kwargs: list[dict] = [
-                {} for _ in range(vllm_config.parallel_config.world_size)
+                {}
+                for _ in range(
+                    max(vllm_config.parallel_config.world_size, group_size)
+                )
             ]
-            all_kwargs[k] = {
-                "vllm_config": vllm_config,
-                "local_rank": k,
+            all_kwargs[local_dp_rank] = {
+                "vllm_config": worker_config,
+                "local_rank": local_dp_rank,
                 "rank": rank,
                 "distributed_init_method": distributed_init_method,
                 "is_driver_worker": is_driver_worker,
                 "shared_worker_lock": shared_worker_lock,
+                "global_dp_rank": global_dp_rank,
             }
             wrapper.init_worker(all_kwargs)
             self.worker.append(wrapper)
@@ -219,26 +250,34 @@ class SharedModelWorkerProc:
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
 
-        # Async scheduling: when enabled, the busy loop offloads
-        # the response enqueue to a background thread so the main
-        # loop can keep dispatching RPCs without blocking on the
-        # MQ write. Mirrors the upstream ``WorkerProc.__init__``
-        # setup.
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
+        # 修改原因：同一物理进程中的多个 DP 各有独立 Future 流，异步结果物化
+        # 速度不同会让后返回的立即值越过先前输出。
+        # 修改内容：建立进程级输出队列，并为每个 local DP 维护独立 sequence。
+        self.async_output_queue: queue.Queue[Any] | None = None
+        self.async_output_copy_thread: Thread | None = None
+        self._async_output_stop = object()
+        self._async_output_error: BaseException | None = None
+        self._next_output_seq = [0] * group_size
+        self._written_output_seq = [0] * group_size
+
+        # 修改原因：一个物理 WorkerProc 同时服务 N 个 EngineCore，标准单 MQ
+        # 初始化无法区分虚拟 DP。
+        # 修改内容：创建 N 个 broadcast reader 和 N 组 response writer/peer。
+        self._init_message_queues(input_shm_handle, vllm_config)
         if self.use_async_scheduling:
-            self.async_output_queue: queue.Queue = queue.Queue()
+            # 修改原因：异步结果物化不能阻塞主 dispatch loop，也不能在多个线程
+            # 间产生跨 DP/同 DP 乱序。
+            # 修改内容：每个物理 edge 进程只启动一个输出线程，队列项携带 local
+            # DP 和序号，串行物化后写回对应 response MQ。
+            self.async_output_queue = queue.Queue()
             self.async_output_copy_thread = Thread(
                 target=self.async_output_busy_loop,
                 daemon=True,
-                name="SharedEdgeWorkerAsyncOutputCopy",
+                name=f"SharedEdgeAsyncOutput-{rank}",
             )
             self.async_output_copy_thread.start()
-
-        # Message queue setup: N (one per dp_rank) broadcast
-        # readers + N response writer/peer pairs. The standard
-        # _init_message_queues is not used.
-        self._init_message_queues(input_shm_handle, vllm_config)
 
         # Pending ``AsyncModelRunnerOutput`` markers (i.e. the
         # ``DeferredExecutePostprocess`` instances returned by
@@ -286,26 +325,25 @@ class SharedModelWorkerProc:
         enforced separately via ``wait_until_ready`` in
         ``worker_main``.
         """
-        dp_size = vllm_config.parallel_config.data_parallel_size
+        group_size = len(self.global_dp_ranks)
 
-        # 1) attach to N edge-broadcast MQs as reader (one per
-        #    dp_rank). The edge executor's broadcast handle is the
-        #    external writer.
+        # 修改原因：各 EngineCore 都有自己的命令流，不能共享同一个读指针。
+        # 修改内容：按 local DP 连接对应 global DP 发布的 broadcast MQ。
         self.rpc_broadcast_mqs = [
             get_inner_dp_world_group_k(k).create_mq_broadcaster(
-                external_writer_handle=self._shared_broadcast_handles[k],
+                external_writer_handle=(
+                    self._shared_broadcast_handles[global_dp_rank]
+                ),
                 blocking=False,
-            ) for k in range(dp_size)
+            )
+            for k, global_dp_rank in enumerate(self.global_dp_ranks)
         ]
 
-        # 2) build the N response MQ pairs (one per dp_rank):
-        #    own response_mq (writer, reader = edge executor_k) +
-        #    peer_handles (c cloud workers' writer handles). The
-        #    return shape matches the upstream ``WorkerProc``:
-        #    ``(self_response_mq, [peer_handles...])``.
+        # 修改原因：每个 EngineCore 必须只消费本 DP 的 edge/cloud 响应。
+        # 修改内容：逐 DP 创建 own response writer，并收集该 DP 云侧 peer handle。
         self.response_mqs = []
         self.peer_response_handles = []
-        for k in range(dp_size):
+        for k in range(group_size):
             response_mq, peer_handles = (
                 get_inner_dp_world_group_k(k)
                 .create_single_reader_mq_broadcasters(
@@ -326,32 +364,25 @@ class SharedModelWorkerProc:
         shared model design needs a multi-MQ round-robin because
         :class:`MessageQueue` has no multi-MQ select primitive.
 
-        Cross-dp_rank pacing
+        跨 DP 节拍修改
         --------------------
-        The shared model runner assumes the per-dp_rank
-        ``execute_model`` / ``execute_dummy_batch`` calls are
-        driven in lockstep — i.e. all dp_ranks finish the current
-        scheduler step before any of them starts the next. To
-        enforce that invariant on the dispatch side, the busy
-        loop runs a "round barrier" over :attr:`SYNC_METHODS`:
+        修改原因：独立 EngineCore 不锁步，空闲 DP 不能成为 round barrier。
+        修改内容：每次 pass 机会式合并已就绪 DP，KV 初始化仍等待全组。
+
+        The shared model runner polls every virtual DP once per pass and
+        opportunistically batches the work already available in that pass:
 
         * On every dispatch whose method is in
           :attr:`SYNC_METHODS`, the dispatching dp_rank is
           marked *paused* and the busy loop will not dequeue
-          from its MQ for the rest of the current round.
-        * At the end of each pass over the MQs, if every
-          dp_rank is paused the round is complete and all
-          dp_ranks are unpaused — a new round begins.
-        * If only a subset of dp_ranks are paused, the round
-          is still in progress; the busy loop simply continues
-          to the next pass. The remaining unpaused dp_ranks
-          will get their chance to dispatch (and pause) in
-          subsequent passes; once every dp_rank is paused,
-          the round resets.
+          from its MQ for the rest of the current pass.
+        * At the end of the pass, any paused DPs form the current batch.
+          Idle DPs are not required to participate.
+        * KV initialization remains a full-group operation and waits until
+          every virtual DP has registered its cache configuration.
         * The pause is *global* per dp_rank — non-SYNC methods
           (e.g. ``add_lora``) queued behind a SYNC method on
-          the same MQ will not be dequeued while the dp_rank
-          is paused. They are picked up on the next round.
+          the same MQ are picked up on the next pass.
 
         Batch postprocess of ``execute_model`` results
         ----------------------------------------------
@@ -387,6 +418,13 @@ class SharedModelWorkerProc:
 
         init_kv_cache = False
         while True:
+            # 修改原因：后台输出线程失败后若主循环继续运行，EngineCore 只会看到
+            # 无响应超时。
+            # 修改内容：在下一轮 dispatch 前把后台异常提升到主线程。
+            if self._async_output_error is not None:
+                raise RuntimeError(
+                    "Shared edge async output thread failed"
+                ) from self._async_output_error
             dispatched = False
             for k, mq in enumerate(self.rpc_broadcast_mqs):
                 if paused[k]:
@@ -405,6 +443,9 @@ class SharedModelWorkerProc:
                 # outer enumerate index k is the dp_rank
                 self._dispatch(k, method, args, kwargs, output_rank)
                 dispatched = True
+                # 修改原因：同一 DP 在一个 pass 中连续提交会独占共享模型，破坏
+                # 跨 DP 合批和请求状态顺序。
+                # 修改内容：真实 execute/dummy/初始化调用后暂停该 DP 到本轮结束。
                 # Round barrier: pause this dp_rank's MQ intake
                 # for the rest of the current round. The check
                 # uses ``in`` on a ``frozenset[str]`` so a
@@ -438,9 +479,19 @@ class SharedModelWorkerProc:
                 if method == 'initialize_from_config':
                     paused[k] = True
                     init_kv_cache = True
-            # End-of-round: if every dp_rank has paused at least
-            # once in this round, the round is complete. Unpause
-            # everyone for the next round AND — crucially — drain
+            # 修改原因：独立调度的 EngineCore 中，空闲 DP 不会发送 execute；
+            # all(paused) 会让活跃 DP 后续 sample_tokens 永远排在暂停点之后。
+            # 修改内容：普通执行只需 any(paused) 即进入 round drain；KV 初始化
+            # 因需汇总全部配置，仍要求 all(paused)。
+            #
+            # Waiting for ``all(paused)`` is invalid for independently
+            # scheduled EngineCores: an idle peer does not issue
+            # ``execute_model``, so the active DP's immediately-following
+            # ``sample_tokens`` RPC would remain behind the pause forever.
+            # KV initialization is the exception and still requires every
+            # virtual DP to register before the shared allocation is built.
+            #
+            # Unpause everyone for the next round AND — crucially — drain
             # the pending ``AsyncModelRunnerOutput`` markers that
             # ``_dispatch`` accumulated during the round. For each
             # marker: if it is *callable* (i.e. a
@@ -459,11 +510,14 @@ class SharedModelWorkerProc:
             # loop crashing. The insertion-ordered iteration
             # over ``self._pending_deferred`` preserves
             # dispatch order.
-            if all(paused) or not self.is_moe:
+            # 修改内容：普通 round 任一 DP 就绪即可推进；KV 初始化仍要求全组。
+            round_ready = (
+                all(paused) if init_kv_cache else any(paused)
+            )
+            if round_ready:
                 if init_kv_cache:
-                    if all(paused):
-                        init_kv_cache = False
-                        paused = [False] * dp_size
+                    init_kv_cache = False
+                    paused = [False] * dp_size
                     continue
                 paused = [False] * dp_size
                 if self._pending_deferred:
@@ -497,6 +551,9 @@ class SharedModelWorkerProc:
                     # the batched head / tail / post only see
                     # the dp_ranks that actually want to be
                     # merged.
+                    # 修改原因：同一 round 可能同时包含可合批 marker 和必须走
+                    # stateful 路径的输出，二者不能共用合并状态。
+                    # 修改内容：按 marker 类型拆成 batched/legacy 两组，分别执行。
                     batched_dp_ranks_list = sorted(
                         k for k, d in pending.items()
                         if _is_batched_execute_marker(d))
@@ -508,6 +565,10 @@ class SharedModelWorkerProc:
                         if k not in batched_pending
                     }
                     if batched_pending:
+                        # 修改原因：每个虚拟 DP 的预处理状态独立，但共享模型的
+                        # head/tail forward 需要在物理 NPU 上合并执行。
+                        # 修改内容：统一运行 head，再为各 DP 建 PP send/recv，
+                        # 最后统一 drain tail 并按 DP 拆分输出。
                         # Phase A — batched head (1× per round).
                         # ``run_batched_head`` and ``drain_batched_round``
                         # are class functions on the vllm_ascend
@@ -586,10 +647,9 @@ class SharedModelWorkerProc:
                     # this loop.
                     for dp_rank, deferred in legacy_pending.items():
                         try:
-                            if callable(deferred):
-                                output = deferred()
-                            else:
-                                output = deferred
+                            # 修改内容：等价压缩 callable/raw 两条 legacy 分支，
+                            # 保持 stateful fallback 的处理语义不变。
+                            output = deferred() if callable(deferred) else deferred
                         except Exception as e:
                             if hasattr(e, "add_note"):
                                 e.add_note(traceback.format_exc())
@@ -620,21 +680,58 @@ class SharedModelWorkerProc:
         returned by ``create_single_reader_mq_broadcasters``) when
         ``output_rank`` matches (mirroring the upstream
         ``worker_busy_loop`` output-routing convention).
+
+        ``output_rank`` is executor-local: rank 0 means this shared edge
+        WorkerProc, regardless of its physical distributed global rank.
+        In grouped-shared mode group 1 has physical rank 1, so comparing
+        ``output_rank`` with ``self.rank`` would silently discard every
+        DP2/DP3 response.
         """
         virtual_worker = self.worker[dp_rank]
+        # 修改原因：output_rank 是当前 EngineCore 响应列表的局部下标，而物理
+        # edge group 1 的全局 rank 可能为 1；与 self.rank 比较会丢弃响应。
+        # 修改内容：共享 edge 在每个 EngineCore 中固定是局部 output rank 0。
+        is_output_worker = output_rank is None or output_rank == 0
         try:
+            # 修改原因：并非所有多模态架构都能安全合并输入和模型特有状态。
+            # 修改内容：调用设备 Worker 的 should_use_batched_execute 策略；
+            # 支持者进入 split batched path，不支持者回退完整 stateful path。
             # Step 11 batched path: route ``execute_model`` RPCs to
             # the new ``execute_model_batched_pre`` interface, which
             # only does per-dp_rank preprocess and returns a
             # ``_BatchedExecuteMarker`` (or an early-return
             # ``ModelRunnerOutput`` / ``None`` for no-work cases).
-            # The original head + send path of ``execute_model`` is
-            # not taken; the busy_loop drives the batched head / tail
-            # / per-dp_rank post on the leader runner.
+            # Workers may reject the batched path for scheduler outputs whose
+            # per-request state cannot be merged. Those outputs retain the
+            # original stateful ``execute_model`` head/send path; otherwise
+            # the busy loop drives batched head/tail/post on the leader runner.
             if method == "execute_model" and hasattr(
-                    virtual_worker, "execute_model_batched_pre"):
-                output = virtual_worker.execute_model_batched_pre(
-                    args[0] if args else None)
+                    virtual_worker.worker, "execute_model_batched_pre"):
+                scheduler_output = args[0] if args else None
+                should_use_batched = getattr(
+                    virtual_worker.worker,
+                    "should_use_batched_execute",
+                    None,
+                )
+                # Some shared workers can batch only a subset of scheduler
+                # outputs. Edge-cloud multimodal requests, for example, own
+                # per-request encoder and M-RoPE state that cannot be merged
+                # by the virtual-DP fast path. Keep this accelerator-specific
+                # policy duck-typed in the worker implementation.
+                use_batched = (
+                    should_use_batched is None
+                    or should_use_batched(scheduler_output)
+                )
+                if use_batched:
+                    output = virtual_worker.execute_model_batched_pre(
+                        scheduler_output)
+                else:
+                    logger.info_once(
+                        "Shared-model batched execution is bypassed for "
+                        "this scheduler output; using the virtual worker's "
+                        "stateful execute_model path.")
+                    output = virtual_worker.execute_model(
+                        scheduler_output)
             elif isinstance(method, str):
                 func = getattr(virtual_worker, method)
                 output = func(*args, **kwargs)
@@ -649,11 +746,13 @@ class SharedModelWorkerProc:
             logger.exception(
                 "SharedModelWorkerProc hit an exception on dp_rank=%d.",
                 dp_rank)
-            if output_rank is None or self.rank == output_rank:
+            # 修改内容：异常与正常结果使用同一局部 output-rank 判定。
+            if is_output_worker:
                 self.handle_output(dp_rank, e)
             return
 
-        if output_rank is None or self.rank == output_rank:
+        # 修改内容：正常结果同样按局部 output rank 0 路由。
+        if is_output_worker:
             # Step 11 batched-compute path: when ``execute_model`` is
             # dispatched, the worker returns a marker that carries a
             # per-dp_rank bundle (in ``output.bundle``). Duck-typed
@@ -665,6 +764,9 @@ class SharedModelWorkerProc:
             # post end-to-end.
             if (method == "execute_model"
                     and getattr(output, "bundle", None) is not None):
+                # 修改原因：batched preprocess 返回的是待 round barrier 消费的
+                # bundle，不是可以立即写回 EngineCore 的最终结果。
+                # 修改内容：按 local DP 保存 bundle 和 marker。
                 self._round_bundles[dp_rank] = output.bundle
                 self._pending_deferred[dp_rank] = output
             elif (method == "execute_model"
@@ -677,13 +779,31 @@ class SharedModelWorkerProc:
                 self.handle_output(dp_rank, output)
 
     def handle_output(self, dp_rank: int, output: Any) -> None:
-        """Route a worker output to the matching dp_rank response
-        MQ, optionally offloading the MQ write to the async
-        output thread (mirrors upstream
-        :meth:`WorkerProc.handle_output`).
+        """Route a worker output to the matching DP response MQ.
+
+        With async scheduling, every response for a virtual DP goes through
+        the same output queue. This includes immediate values such as ``None``
+        and exceptions: bypassing the queue for those values could let them
+        overtake an earlier ``AsyncModelRunnerOutput`` on the same response MQ.
         """
+        if not 0 <= dp_rank < len(self.response_mqs):
+            raise IndexError(
+                f"Invalid local dp_rank={dp_rank}; "
+                f"response_mq_count={len(self.response_mqs)}"
+            )
+        if self._async_output_error is not None:
+            raise RuntimeError("Shared edge async output thread failed") from (
+                self._async_output_error
+            )
+
         if self.use_async_scheduling:
-            self.async_output_queue.put((dp_rank, output))
+            # 修改原因：立即输出、异常和 AsyncModelRunnerOutput 若走不同通道，
+            # 同一 DP 的后一个输出可能越过前一个异步输出。
+            # 修改内容：所有输出统一进入带 DP sequence 的 FIFO 队列。
+            assert self.async_output_queue is not None
+            sequence_id = self._next_output_seq[dp_rank]
+            self._next_output_seq[dp_rank] += 1
+            self.async_output_queue.put((dp_rank, sequence_id, output))
         else:
             self.enqueue_output(dp_rank, output)
 
@@ -693,8 +813,19 @@ class SharedModelWorkerProc:
         If ``output`` is an ``AsyncModelRunnerOutput`` (async
         scheduling mode), extract the real output first.
         """
-        if isinstance(output, AsyncModelRunnerOutput):
-            output = output.get_output()
+        try:
+            # 修改原因：异步物化可能在后台线程中抛错，不能让线程静默退出。
+            # 修改内容：把物化异常转换成匹配 DP 的 FAILURE response。
+            if isinstance(output, AsyncModelRunnerOutput):
+                output = output.get_output()
+        except Exception as e:
+            if hasattr(e, "add_note"):
+                e.add_note(traceback.format_exc())
+            logger.exception(
+                "Shared edge async output materialization failed on local_dp_rank=%d.",
+                dp_rank,
+            )
+            output = e
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
@@ -702,17 +833,61 @@ class SharedModelWorkerProc:
         self.response_mqs[dp_rank].enqueue(result)
 
     def async_output_busy_loop(self) -> None:
-        """Drain ``async_output_queue`` and write each item to the
-        matching per-dp_rank response MQ (mirrors upstream
-        :meth:`WorkerProc.async_output_busy_loop`)."""
-        if hasattr(self.worker[0], "device"):
-            current_platform.set_device(self.worker[0].device)
-        while True:
-            dp_rank, output = self.async_output_queue.get()
-            self.enqueue_output(dp_rank, output)
+        """在不阻塞共享模型调度的情况下按 DP 保序物化输出。
+
+        修改原因：多个虚拟 DP 共用一张 NPU，但各 EngineCore 的 Future 流必须
+        独立且严格 FIFO。
+        修改内容：单线程消费全局 FIFO，并用每 DP sequence 做额外一致性校验。
+        """
+        try:
+            if self.worker and hasattr(self.worker[0], "device"):
+                current_platform.set_device(self.worker[0].device)
+
+            assert self.async_output_queue is not None
+            while True:
+                item = self.async_output_queue.get()
+                if item is self._async_output_stop:
+                    return
+
+                dp_rank, sequence_id, output = item
+                expected = self._written_output_seq[dp_rank]
+                if sequence_id != expected:
+                    output = RuntimeError(
+                        "Shared edge async output sequence mismatch: "
+                        f"local_dp_rank={dp_rank}, expected={expected}, "
+                        f"received={sequence_id}"
+                    )
+                self.enqueue_output(dp_rank, output)
+                self._written_output_seq[dp_rank] = sequence_id + 1
+        except BaseException as e:
+            self._async_output_error = e
+            logger.exception("Shared edge async output thread failed.")
+
+    def _stop_async_output_thread(self) -> None:
+        """排空输出队列并停止边侧输出线程。
+
+        修改原因：先关闭 response MQ 会丢失尚未物化的异步结果。
+        修改内容：stop marker 排在现有任务之后，并限时等待输出线程退出。
+        """
+        output_thread = self.async_output_copy_thread
+        output_queue = self.async_output_queue
+        if output_thread is None or output_queue is None:
+            return
+
+        output_queue.put(self._async_output_stop)
+        output_thread.join(timeout=10)
+        if output_thread.is_alive():
+            logger.warning(
+                "Shared edge async output thread did not stop within 10 seconds."
+            )
+        self.async_output_copy_thread = None
+        self.async_output_queue = None
 
     # ------------------------------------------------------------- shutdown
     def shutdown(self) -> None:
+        # 修改原因：response MQ 关闭前必须完成已排队输出。
+        # 修改内容：先停止并排空异步输出线程，再关闭各 MQ 和虚拟 Worker。
+        self._stop_async_output_thread()
         for mq in getattr(self, "rpc_broadcast_mqs", []) or []:
             if mq is not None:
                 mq.shutdown()
@@ -763,6 +938,8 @@ class SharedModelWorkerProc:
         shared_worker_lock: LockType,
         is_driver_worker: bool,
         shared_broadcast_handles: dict[int, Handle] | None = None,
+        # 修改内容：把本物理进程承载的全局 DP 子集继续透传给子进程入口。
+        global_dp_ranks: tuple[int, ...] | None = None,
         inherited_fds: list[int] | None = None,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
@@ -772,6 +949,9 @@ class SharedModelWorkerProc:
             inherited_fds = inherited_fds.copy()
             inherited_fds.extend((ready_reader.fileno(),
                                   death_writer.fileno()))
+        # 修改原因：子进程需要知道自己实际承载的全局 DP 子集，不能默认处理
+        # data_parallel_size 中的全部 DP。
+        # 修改内容：把 global_dp_ranks 随进程启动参数传入。
         process_kwargs: dict[str, Any] = {
             "vllm_config": vllm_config,
             "local_rank": local_rank,
@@ -785,6 +965,8 @@ class SharedModelWorkerProc:
             "inherited_fds":
                 inherited_fds if inherited_fds is not None else [],
             "shared_broadcast_handles": shared_broadcast_handles,
+            # 修改内容：子进程据此只创建本组虚拟 Worker。
+            "global_dp_ranks": global_dp_ranks,
         }
         proc = context.Process(
             target=SharedModelWorkerProc.worker_main,
@@ -936,10 +1118,17 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
       readers for the c cloud workers' response MQs (for this
       dp_rank). Both are produced by reading the raw handles from
       the worker's ready dict and attaching them locally.
-    * Only the dp_rank=0 executor starts the shared edge
-      ``WorkerProc``; the others just create their own broadcast
-      MQ and exchange handles through the gloo group.
+    * The first DP rank in each edge group starts that group's shared
+      ``WorkerProc``; the other group members exchange handles through
+      the gloo store.
     """
+
+    @cached_property
+    def max_concurrent_batches(self) -> int:
+        # 修改原因：共享 edge 不是标准本地 PP pipeline，每个虚拟 runner 只有
+        # 一个 execute_model_state 槽；no-async 若继承 PP=2 会覆盖状态。
+        # 修改内容：async 允许标准双 batch overlap，no-async 强制单 batch。
+        return 2 if self.scheduler_config.async_scheduling else 1
 
     def _init_executor(self) -> None:
         self._finalizer = weakref.finalize(self, self.shutdown)
@@ -957,11 +1146,28 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
         mq_connect_ip = get_ip()
         dp_size = self.parallel_config.data_parallel_size
+        # 修改原因：每个 EngineCore 需要知道自己所在的物理 edge group、组内
+        # 下标和 leader，才能正确交换 MQ handle 与启动唯一 WorkerProc。
+        # 修改内容：从 ParallelConfig 解析并缓存本组拓扑信息。
+        self.edge_group_id = self.parallel_config.edge_group_id(
+            self.parallel_config.data_parallel_rank)
+        self.group_dp_ranks = self.parallel_config.edge_group_dp_ranks(
+            self.edge_group_id)
+        self.group_local_dp_rank = (
+            self.parallel_config.edge_group_local_rank(
+                self.parallel_config.data_parallel_rank))
+        self.group_leader_dp_rank = (
+            self.parallel_config.edge_group_leader_dp_rank(
+                self.edge_group_id))
         logger.info(
             "SharedModel edge executor: dp_rank=%d, dp_size=%d, "
+            "edge_group_id=%d, group_local_dp_rank=%d, group_dp_ranks=%s, "
             "world_size=%d, local_world_size=%d, mq_connect_ip=%s",
             self.parallel_config.data_parallel_rank,
             dp_size,
+            self.edge_group_id,
+            self.group_local_dp_rank,
+            self.group_dp_ranks,
             self.world_size,
             self.local_world_size,
             mq_connect_ip,
@@ -974,10 +1180,10 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
         )
         own_broadcast_handle = self.rpc_broadcast_mq.export_handle()
 
-        # Join the edge-only gloo group (dp_size members) and use
-        # the store to exchange handles: each edge executor
-        # publishes its own broadcast handle, and the dp_rank=0
-        # executor starts the shared edge WorkerProc.
+        # 修改原因：同组多个 EngineCore 分属不同进程，需要交换各自 MQ handle；
+        # 多组并存时 key 还必须避免冲突。
+        # 修改内容：使用带 edge_group_id 命名空间的 gloo store，并由组 leader
+        # 在收齐 handle 后启动共享 WorkerProc。
         dp_group_pg, dp_group_store = (
             self.parallel_config.stateless_init_dp_group(
                 return_store=True))
@@ -996,7 +1202,8 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
             # Step 1: each executor publishes its own broadcast
             # handle to the gloo store.
             self._publish_broadcast_handle(own_broadcast_handle)
-            # Step 2: dp_rank=0 starts the shared edge WorkerProc
+            # 修改内容：不再固定 DP0，而由每个 edge group 的 leader 启动本组
+            # 唯一共享 WorkerProc。
             # and waits for it to become ready (returns the raw
             # handle dict). All other executors do nothing — they
             # will read the per-dp_rank handles from the gloo
@@ -1054,18 +1261,32 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
         """Publish this executor's broadcast MQ handle to the
         edge-only gloo store under a per-dp_rank key."""
         assert self._dp_group_store is not None
-        key = (f"shared_edge_broadcast_handle/"
-               f"{self.parallel_config.data_parallel_rank}")
+        # 修改原因：grouped_shared 中不同物理组可能包含相同的组内 DP 下标。
+        # 修改内容：store key 同时包含 edge group id 和 global DP rank。
+        key = (
+            f"shared_edge/{self.edge_group_id}/broadcast/"
+            f"{self.parallel_config.data_parallel_rank}"
+        )
         self._dp_group_store.set(key, pickle.dumps(handle))
 
     def _collect_broadcast_handles(self) -> dict[int, Handle]:
-        """dp_rank=0 only: collect all broadcast handles from the
-        edge-only gloo store."""
-        assert self.parallel_config.data_parallel_rank == 0
+        """组 leader 收集本组 broadcast handle。
+
+        修改原因：每个物理 WorkerProc 只能连接自己承载的 DP 命令队列。
+        修改内容：仅遍历 group_dp_ranks，并按全局 DP rank 保存 handle。
+        """
+        assert (
+            self.parallel_config.data_parallel_rank
+            == self.group_leader_dp_rank
+        )
         handles: dict[int, Handle] = {}
-        for k in range(self.parallel_config.data_parallel_size):
-            key = f"shared_edge_broadcast_handle/{k}"
-            handles[k] = pickle.loads(self._dp_group_store.get(key))
+        for global_dp_rank in self.group_dp_ranks:
+            key = (
+                f"shared_edge/{self.edge_group_id}/broadcast/"
+                f"{global_dp_rank}"
+            )
+            handles[global_dp_rank] = pickle.loads(
+                self._dp_group_store.get(key))
         return handles
 
     def _publish_per_dp_rank_handles(
@@ -1073,24 +1294,47 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
         response_handles: list[Handle],
         peer_response_handles: list[list[Handle]],
     ) -> None:
-        """dp_rank=0 only: publish the per-dp_rank response /
-        peer-response handles to the edge-only gloo store so the
-        other edge executors can read them."""
-        assert self.parallel_config.data_parallel_rank == 0
-        for k, h in enumerate(response_handles):
-            key = f"shared_edge_response_handle/{k}"
+        """组 leader 发布本组 response handle。
+
+        修改原因：非 leader EngineCore 没有子进程 ready_dict。
+        修改内容：把 own/peer response handle 按 group/global DP 命名后写入 store。
+        """
+        assert (
+            self.parallel_config.data_parallel_rank
+            == self.group_leader_dp_rank
+        )
+        assert len(response_handles) == len(self.group_dp_ranks)
+        assert len(peer_response_handles) == len(self.group_dp_ranks)
+        for global_dp_rank, h in zip(
+            self.group_dp_ranks, response_handles, strict=True
+        ):
+            key = (
+                f"shared_edge/{self.edge_group_id}/response/"
+                f"{global_dp_rank}"
+            )
             self._dp_group_store.set(key, pickle.dumps(h))
-        for k, hs in enumerate(peer_response_handles):
-            key = f"shared_edge_peer_response_handles/{k}"
+        for global_dp_rank, hs in zip(
+            self.group_dp_ranks, peer_response_handles, strict=True
+        ):
+            key = (
+                f"shared_edge/{self.edge_group_id}/peer_response/"
+                f"{global_dp_rank}"
+            )
             self._dp_group_store.set(key, pickle.dumps(hs))
 
-    # --------------------------------- shared edge WorkerProc spawn (dp_rank=0)
+    # ------------------------------------ shared edge WorkerProc group leader
     def _spawn_shared_edge_worker_if_master(
         self,
     ) -> tuple[dict[str, Any] | None, list[UnreadyWorkerProcHandle]]:
-        """dp_rank=0: spawn the shared edge ``WorkerProc``, wait for
-        it to be ready, and publish the per-dp_rank response /
-        peer-response handles to the gloo store. Other dp_ranks:
+        """由组 leader 启动唯一共享边侧 WorkerProc。
+
+        修改原因：每个 EngineCore 都启动进程会重复加载模型并争用同一 NPU。
+        修改内容：非 leader 直接返回；leader 收集本组 handle、传入本组全局 DP
+        列表，等待 ready 后发布 response handle。
+
+        On the group leader, spawn the shared edge ``WorkerProc``, wait
+        for it to be ready, and publish the per-DP response /
+        peer-response handles to the gloo store. Other group members:
         return ``(None, [])`` (they will read the handles from
         the store directly in :meth:`_attach_response_mqs`).
 
@@ -1100,7 +1344,11 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
         caller can pass it into the failure cleanup in
         :meth:`_init_executor` (mirroring the upstream
         ``MultiprocExecutor`` pattern)."""
-        if self.parallel_config.data_parallel_rank != 0:
+        # 修改内容：只有当前 edge group 的 leader 进入 spawn 流程。
+        if (
+            self.parallel_config.data_parallel_rank
+            != self.group_leader_dp_rank
+        ):
             return None, []
         broadcast_handles = self._collect_broadcast_handles()
         context = get_mp_context()
@@ -1108,13 +1356,15 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
         proc_handle = SharedModelWorkerProc.make_worker_process(
             vllm_config=self.vllm_config,
             local_rank=0,
-            rank=0,
+            # 修改内容：子进程物理 rank 使用 edge group id，并携带本组 DP 列表。
+            rank=self.edge_group_id,
             distributed_init_method=get_distributed_init_method(
                 get_loopback_ip(), get_open_port()),
             input_shm_handle=None,
             shared_worker_lock=shared_worker_lock,
             is_driver_worker=True,
             shared_broadcast_handles=broadcast_handles,
+            global_dp_ranks=self.group_dp_ranks,
         )
         unready_workers = [proc_handle]
         ready_dict = SharedModelWorkerProc.wait_for_ready(unready_workers)
@@ -1130,21 +1380,30 @@ class SharedModelMultiprocExecutor(MultiprocExecutor):
     def _attach_response_mqs(
         self, ready_dict: dict[str, Any] | None
     ) -> None:
-        """Attach this executor's own response MQ (reader) and the
-        c cloud workers' response MQs (readers). For dp_rank=0
+        """连接当前 EngineCore 自己的 edge/cloud response MQ。
+
+        修改原因：ready_dict 中的数组按组内 local DP 排列，而 store 使用 global
+        DP 命名；混用会让 grouped_shared 的 DP2/DP3 接错响应。
+        修改内容：leader 按 group_local_dp_rank 取 ready_dict，其他成员按
+        global DP key 从 store 获取。
+
+        Attach this executor's own response MQ (reader) and the
+        c cloud workers' response MQs (readers). For the group leader
         the handles come from the ``ready_dict`` already in hand;
         for non-master executors the handles come from the gloo
         store."""
         my_dp_rank = self.parallel_config.data_parallel_rank
         if ready_dict is not None:
-            own_handle = ready_dict["response_handles"][my_dp_rank]
-            peer_handles = ready_dict["peer_response_handles"][my_dp_rank]
+            own_handle = ready_dict["response_handles"][
+                self.group_local_dp_rank]
+            peer_handles = ready_dict["peer_response_handles"][
+                self.group_local_dp_rank]
         else:
             assert self._dp_group_store is not None
             own_handle = pickle.loads(self._dp_group_store.get(
-                f"shared_edge_response_handle/{my_dp_rank}"))
+                f"shared_edge/{self.edge_group_id}/response/{my_dp_rank}"))
             peer_handles = pickle.loads(self._dp_group_store.get(
-                f"shared_edge_peer_response_handles/{my_dp_rank}"))
+                f"shared_edge/{self.edge_group_id}/peer_response/{my_dp_rank}"))
 
         self.response_mqs = []
         if own_handle is not None and len(
