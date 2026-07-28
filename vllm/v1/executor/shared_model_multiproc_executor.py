@@ -247,33 +247,31 @@ class SharedModelWorkerProc:
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
 
+        # Each virtual DP owns an independent output queue and materialization
+        # thread. A pending NPU event on one DP must not block the shared worker
+        # dispatch loop or the response stream of another DP.
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
-        self.async_output_queue: queue.Queue[Any] | None = None
-        self.async_output_copy_thread: Thread | None = None
+        self.async_output_queues: list[queue.Queue[Any]] = []
+        self.async_output_copy_threads: list[Thread] = []
         self._async_output_stop = object()
-        self._async_output_error: BaseException | None = None
-        self._next_output_seq = [0] * group_size
-        self._written_output_seq = [0] * group_size
+        self._async_output_errors: list[BaseException | None] = [None] * group_size
 
         # Message queue setup: N (one per dp_rank) broadcast
         # readers + N response writer/peer pairs. The standard
         # _init_message_queues is not used.
         self._init_message_queues(input_shm_handle, vllm_config)
         if self.use_async_scheduling:
-            # One output thread per physical edge process, not per virtual DP.
-            # Both virtual workers share one NPU, so output materialization is
-            # serialized while the main thread can launch the next model batch.
-            # Every queued item carries its local DP rank and a per-DP sequence
-            # number so the two independent EngineCore Future streams cannot
-            # be cross-routed or reordered.
-            self.async_output_queue = queue.Queue()
-            self.async_output_copy_thread = Thread(
-                target=self.async_output_busy_loop,
-                daemon=True,
-                name=f"SharedEdgeAsyncOutput-{rank}",
-            )
-            self.async_output_copy_thread.start()
+            self.async_output_queues = [queue.Queue() for _ in range(group_size)]
+            for dp_rank in range(group_size):
+                output_thread = Thread(
+                    target=self.async_output_busy_loop,
+                    args=(dp_rank,),
+                    daemon=True,
+                    name=f"SharedEdgeAsyncOutput-DP{dp_rank}",
+                )
+                output_thread.start()
+                self.async_output_copy_threads.append(output_thread)
 
         # Pending ``AsyncModelRunnerOutput`` markers (i.e. the
         # ``DeferredExecutePostprocess`` instances returned by
@@ -415,10 +413,6 @@ class SharedModelWorkerProc:
 
         init_kv_cache = False
         while True:
-            if self._async_output_error is not None:
-                raise RuntimeError(
-                    "Shared edge async output thread failed"
-                ) from self._async_output_error
             dispatched = False
             for k, mq in enumerate(self.rpc_broadcast_mqs):
                 if paused[k]:
@@ -752,26 +746,30 @@ class SharedModelWorkerProc:
     def handle_output(self, dp_rank: int, output: Any) -> None:
         """Route a worker output to the matching DP response MQ.
 
-        With async scheduling, every response for a virtual DP goes through
-        the same output queue. This includes immediate values such as ``None``
-        and exceptions: bypassing the queue for those values could let them
-        overtake an earlier ``AsyncModelRunnerOutput`` on the same response MQ.
+        With async scheduling, each virtual DP has its own FIFO output queue
+        and materialization thread. Immediate and asynchronous outputs use the
+        same queue so they cannot be reordered within a DP, while an NPU event
+        wait on one DP cannot block another DP or the shared dispatch thread.
         """
         if not 0 <= dp_rank < len(self.response_mqs):
             raise IndexError(
                 f"Invalid local dp_rank={dp_rank}; "
                 f"response_mq_count={len(self.response_mqs)}"
             )
-        if self._async_output_error is not None:
-            raise RuntimeError("Shared edge async output thread failed") from (
-                self._async_output_error
-            )
-
         if self.use_async_scheduling:
-            assert self.async_output_queue is not None
-            sequence_id = self._next_output_seq[dp_rank]
-            self._next_output_seq[dp_rank] += 1
-            self.async_output_queue.put((dp_rank, sequence_id, output))
+            output_error = self._async_output_errors[dp_rank]
+            if output_error is not None:
+                raise RuntimeError(
+                    "Shared edge async output thread failed for "
+                    f"local_dp_rank={dp_rank}"
+                ) from output_error
+            if len(self.async_output_queues) != len(self.response_mqs):
+                raise RuntimeError(
+                    "Shared edge async output queues are not initialized: "
+                    f"queue_count={len(self.async_output_queues)}, "
+                    f"response_mq_count={len(self.response_mqs)}"
+                )
+            self.async_output_queues[dp_rank].put(output)
         else:
             self.enqueue_output(dp_rank, output)
 
@@ -798,58 +796,52 @@ class SharedModelWorkerProc:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         self.response_mqs[dp_rank].enqueue(result)
 
-    def async_output_busy_loop(self) -> None:
-        """Materialize outputs without blocking shared-model dispatch.
-
-        A single thread serves both virtual DPs hosted by this physical edge
-        process. The queue is globally FIFO and sequence IDs additionally
-        enforce FIFO within each DP's independent response stream.
-        """
+    def async_output_busy_loop(self, dp_rank: int) -> None:
+        """Materialize one virtual DP's outputs in strict FIFO order."""
         try:
-            if self.worker and hasattr(self.worker[0], "device"):
-                current_platform.set_device(self.worker[0].device)
+            virtual_workers = getattr(self, "worker", [])
+            if (
+                dp_rank < len(virtual_workers)
+                and hasattr(virtual_workers[dp_rank], "device")
+            ):
+                current_platform.set_device(virtual_workers[dp_rank].device)
 
-            assert self.async_output_queue is not None
+            output_queue = self.async_output_queues[dp_rank]
             while True:
-                item = self.async_output_queue.get()
-                if item is self._async_output_stop:
+                output = output_queue.get()
+                if output is self._async_output_stop:
                     return
-
-                dp_rank, sequence_id, output = item
-                expected = self._written_output_seq[dp_rank]
-                if sequence_id != expected:
-                    output = RuntimeError(
-                        "Shared edge async output sequence mismatch: "
-                        f"local_dp_rank={dp_rank}, expected={expected}, "
-                        f"received={sequence_id}"
-                    )
                 self.enqueue_output(dp_rank, output)
-                self._written_output_seq[dp_rank] = sequence_id + 1
         except BaseException as e:
-            self._async_output_error = e
-            logger.exception("Shared edge async output thread failed.")
-
-    def _stop_async_output_thread(self) -> None:
-        """Drain queued outputs and stop the per-edge output thread."""
-        output_thread = self.async_output_copy_thread
-        output_queue = self.async_output_queue
-        if output_thread is None or output_queue is None:
-            return
-
-        output_queue.put(self._async_output_stop)
-        output_thread.join(timeout=10)
-        if output_thread.is_alive():
-            logger.warning(
-                "Shared edge async output thread did not stop within 10 seconds."
+            self._async_output_errors[dp_rank] = e
+            logger.exception(
+                "Shared edge async output thread failed for "
+                "local_dp_rank=%d.",
+                dp_rank,
             )
-        self.async_output_copy_thread = None
-        self.async_output_queue = None
+
+    def _stop_async_output_threads(self) -> None:
+        """Drain and stop every per-DP output thread before closing MQs."""
+        output_queues = getattr(self, "async_output_queues", [])
+        output_threads = getattr(self, "async_output_copy_threads", [])
+        for output_queue in output_queues:
+            output_queue.put(self._async_output_stop)
+        for dp_rank, output_thread in enumerate(output_threads):
+            output_thread.join(timeout=10)
+            if output_thread.is_alive():
+                logger.warning(
+                    "Shared edge async output thread for local_dp_rank=%d "
+                    "did not stop within 10 seconds.",
+                    dp_rank,
+                )
+        self.async_output_copy_threads = []
+        self.async_output_queues = []
 
     # ------------------------------------------------------------- shutdown
     def shutdown(self) -> None:
-        # The stop marker is appended after all pending outputs, so the output
-        # thread drains them before response MQs are closed.
-        self._stop_async_output_thread()
+        # Stop markers are appended after pending outputs, so each DP drains
+        # its own FIFO before its response MQ is closed.
+        self._stop_async_output_threads()
         for mq in getattr(self, "rpc_broadcast_mqs", []) or []:
             if mq is not None:
                 mq.shutdown()
